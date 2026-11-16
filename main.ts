@@ -1,18 +1,30 @@
-// ai-excited-01 v4 — "Sunset Leap": a train leaps the broken bridge at sunset.
-// Procedural pixel renderer + PNG encoder, written from scratch.
-// Node 22, stdlib only, no network, fully deterministic (fixed-seed PRNG).
-import * as fs from "node:fs";
-import * as path from "node:path";
-import * as zlib from "node:zlib";
+// ai-excited-01 v8 — "DON'T BLINK, JUDGE! THE WAVE EATS THE SUN"
+// A lone surfer drops into a giant curling wave that glows gold from inside
+// at sunset: spray exploding off the lip, the horizon burning orange, one tiny
+// human silhouette against a wall of water. Fear and awe in the same frame.
+//
+// Node 22, standard library only. Deterministic: fixed seed, no clock, no
+// network, no Math.random. Two runs write byte-identical PNGs.
+//
+// Run:  mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts
+// Writes /output/entry.png by default (MAKEFUN_OUTPUT_DIR overrides it).
+
+import { createHash } from 'node:crypto';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { deflateSync } from 'node:zlib';
 
 const W = 1024;
 const H = 1024;
-const img = new Uint8Array(W * H * 3);
+const HORIZON = 640;
 
-// ---- deterministic PRNG (mulberry32, fixed seed) ----
-function mulberry32(seed: number): () => number {
+// ---------------------------------------------------------------------------
+// Deterministic PRNG (mulberry32, fixed seed). Every random call below happens
+// in a fixed order, so the picture is identical on every run.
+// ---------------------------------------------------------------------------
+function mulberry32(seed) {
   let a = seed >>> 0;
-  return () => {
+  return function () {
     a |= 0;
     a = (a + 0x6d2b79f5) | 0;
     let t = Math.imul(a ^ (a >>> 15), 1 | a);
@@ -20,49 +32,118 @@ function mulberry32(seed: number): () => number {
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 }
-const rnd = mulberry32(20261116);
+const rand = mulberry32(20261117);
 
-// ---- color helpers ----
-type RGB = [number, number, number];
-function clamp255(v: number): number {
-  return v < 0 ? 0 : v > 255 ? 255 : Math.round(v);
+// ---------------------------------------------------------------------------
+// Canvas: RGBA buffer, origin top-left.
+// ---------------------------------------------------------------------------
+const px = new Uint8Array(W * H * 4);
+
+function clamp(v, a, b) {
+  return v < a ? a : v > b ? b : v;
 }
-function mix(a: number, b: number, t: number): number {
+function lerp(a, b, t) {
   return a + (b - a) * t;
 }
-function mixC(c1: RGB, c2: RGB, t: number): RGB {
-  return [mix(c1[0], c2[0], t), mix(c1[1], c2[1], t), mix(c1[2], c2[2], t)];
+function mix3(c1, c2, t) {
+  return [lerp(c1[0], c2[0], t), lerp(c1[1], c2[1], t), lerp(c1[2], c2[2], t)];
 }
 
-function put(x: number, y: number, c: RGB, alpha = 1): void {
-  const xi = Math.round(x);
-  const yi = Math.round(y);
-  if (xi < 0 || xi >= W || yi < 0 || yi >= H) return;
-  const i = (yi * W + xi) * 3;
-  if (alpha >= 1) {
-    img[i] = clamp255(c[0]);
-    img[i + 1] = clamp255(c[1]);
-    img[i + 2] = clamp255(c[2]);
-  } else {
-    const inv = 1 - alpha;
-    img[i] = clamp255(img[i] * inv + c[0] * alpha);
-    img[i + 1] = clamp255(img[i + 1] * inv + c[1] * alpha);
-    img[i + 2] = clamp255(img[i + 2] * inv + c[2] * alpha);
+// Opaque write.
+function put(x, y, r, g, b) {
+  if (x < 0 || x >= W || y < 0 || y >= H) return;
+  const i = (y * W + x) * 4;
+  px[i] = r | 0;
+  px[i + 1] = g | 0;
+  px[i + 2] = b | 0;
+  px[i + 3] = 255;
+}
+
+// Alpha-blended write (a in 0..1).
+function blend(x, y, r, g, b, a) {
+  if (a <= 0) return;
+  if (x < 0 || x >= W || y < 0 || y >= H) return;
+  const i = (y * W + x) * 4;
+  if (a >= 1) {
+    px[i] = r | 0;
+    px[i + 1] = g | 0;
+    px[i + 2] = b | 0;
+    px[i + 3] = 255;
+    return;
+  }
+  const ia = 1 - a;
+  px[i] = Math.round(r * a + px[i] * ia);
+  px[i + 1] = Math.round(g * a + px[i + 1] * ia);
+  px[i + 2] = Math.round(b * a + px[i + 2] * ia);
+  px[i + 3] = 255;
+}
+
+function fillRect(x0, y0, x1, y1, r, g, b) {
+  for (let y = Math.max(0, y0); y < Math.min(H, y1); y++) {
+    for (let x = Math.max(0, x0); x < Math.min(W, x1); x++) put(x, y, r, g, b);
   }
 }
 
-// ---- filled shapes ----
-function fillRect(x0: number, y0: number, x1: number, y1: number, c: RGB, alpha = 1): void {
-  const xa = Math.max(0, Math.floor(x0));
-  const xb = Math.min(W - 1, Math.ceil(x1));
-  const ya = Math.max(0, Math.floor(y0));
-  const yb = Math.min(H - 1, Math.ceil(y1));
-  for (let y = ya; y <= yb; y++) {
-    for (let x = xa; x <= xb; x++) put(x, y, c, alpha);
+// Filled ellipse with alpha.
+function ellipse(cx, cy, rx, ry, r, g, b, a) {
+  const y0 = Math.max(0, Math.floor(cy - ry));
+  const y1 = Math.min(H - 1, Math.ceil(cy + ry));
+  for (let y = y0; y <= y1; y++) {
+    const t = (y - cy) / ry;
+    const half = rx * Math.sqrt(Math.max(0, 1 - t * t));
+    const x0 = Math.max(0, Math.ceil(cx - half));
+    const x1 = Math.min(W - 1, Math.floor(cx + half));
+    for (let x = x0; x <= x1; x++) blend(x, y, r, g, b, a);
   }
 }
 
-function fillPoly(pts: Array<[number, number]>, c: RGB, alpha = 1): void {
+// Filled disc with alpha.
+function disc(cx, cy, rad, r, g, b, a) {
+  const r0 = Math.max(0, Math.floor(cy - rad));
+  const r1 = Math.min(H - 1, Math.ceil(cy + rad));
+  for (let y = r0; y <= r1; y++) {
+    const dy = y - cy;
+    const half = Math.sqrt(Math.max(0, rad * rad - dy * dy));
+    const x0 = Math.max(0, Math.ceil(cx - half));
+    const x1 = Math.min(W - 1, Math.floor(cx + half));
+    for (let x = x0; x <= x1; x++) blend(x, y, r, g, b, a);
+  }
+}
+
+// Thick line drawn as a chain of discs.
+function thickLine(x0, y0, x1, y1, w, r, g, b, a) {
+  const dx = x1 - x0;
+  const dy = y1 - y0;
+  const len = Math.hypot(dx, dy);
+  const steps = Math.max(1, Math.ceil(len / 0.6));
+  for (let s = 0; s <= steps; s++) {
+    const t = s / steps;
+    disc(x0 + dx * t, y0 + dy * t, w / 2, r, g, b, a);
+  }
+}
+
+function cubic(p0, p1, p2, p3, t) {
+  const u = 1 - t;
+  return [
+    u * u * u * p0[0] + 3 * u * u * t * p1[0] + 3 * u * t * t * p2[0] + t * t * t * p3[0],
+    u * u * u * p0[1] + 3 * u * u * t * p1[1] + 3 * u * t * t * p2[1] + t * t * t * p3[1],
+  ];
+}
+function quad(p0, p1, p2, t) {
+  const u = 1 - t;
+  return [
+    u * u * p0[0] + 2 * u * t * p1[0] + t * t * p2[0],
+    u * u * p0[1] + 2 * u * t * p1[1] + t * t * p2[1],
+  ];
+}
+function sampleCurve(fn, n) {
+  const pts = [];
+  for (let i = 0; i <= n; i++) pts.push(fn(i / n));
+  return pts;
+}
+
+// Scanline polygon fill; shader(x, y) returns [r, g, b, a].
+function fillPolyShader(pts, shader) {
   let minY = H;
   let maxY = 0;
   for (const p of pts) {
@@ -71,678 +152,401 @@ function fillPoly(pts: Array<[number, number]>, c: RGB, alpha = 1): void {
   }
   minY = Math.max(0, minY);
   maxY = Math.min(H - 1, maxY);
+  const n = pts.length;
   for (let y = minY; y <= maxY; y++) {
-    const yc = y + 0.5;
-    const xs: number[] = [];
-    for (let i = 0; i < pts.length; i++) {
-      const p1 = pts[i];
-      const p2 = pts[(i + 1) % pts.length];
-      if ((p1[1] <= yc && p2[1] > yc) || (p2[1] <= yc && p1[1] > yc)) {
-        xs.push(p1[0] + ((yc - p1[1]) / (p2[1] - p1[1])) * (p2[0] - p1[0]));
+    const xs = [];
+    for (let i = 0; i < n; i++) {
+      const a = pts[i];
+      const b = pts[(i + 1) % n];
+      if ((a[1] <= y && b[1] > y) || (b[1] <= y && a[1] > y)) {
+        const t = (y - a[1]) / (b[1] - a[1]);
+        xs.push(a[0] + t * (b[0] - a[0]));
       }
     }
-    xs.sort((a, b) => a - b);
+    xs.sort((p, q) => p - q);
     for (let k = 0; k + 1 < xs.length; k += 2) {
       const x0 = Math.max(0, Math.ceil(xs[k]));
       const x1 = Math.min(W - 1, Math.floor(xs[k + 1]));
-      for (let x = x0; x <= x1; x++) put(x, y, c, alpha);
-    }
-  }
-}
-
-function disc(cx: number, cy: number, r: number, c: RGB, alpha = 1): void {
-  if (r <= 0) return;
-  const y0 = Math.max(0, Math.floor(cy - r));
-  const y1 = Math.min(H - 1, Math.ceil(cy + r));
-  for (let y = y0; y <= y1; y++) {
-    const dy = y + 0.5 - cy;
-    const dx = Math.sqrt(Math.max(0, r * r - dy * dy));
-    const x0 = Math.max(0, Math.ceil(cx - dx));
-    const x1 = Math.min(W - 1, Math.floor(cx + dx));
-    for (let x = x0; x <= x1; x++) put(x, y, c, alpha);
-  }
-}
-
-function ellipse(cx: number, cy: number, rx: number, ry: number, c: RGB, alpha = 1): void {
-  if (rx <= 0 || ry <= 0) return;
-  const y0 = Math.max(0, Math.floor(cy - ry));
-  const y1 = Math.min(H - 1, Math.ceil(cy + ry));
-  for (let y = y0; y <= y1; y++) {
-    const dy = (y + 0.5 - cy) / ry;
-    const dx = rx * Math.sqrt(Math.max(0, 1 - dy * dy));
-    const x0 = Math.max(0, Math.ceil(cx - dx));
-    const x1 = Math.min(W - 1, Math.floor(cx + dx));
-    for (let x = x0; x <= x1; x++) put(x, y, c, alpha);
-  }
-}
-
-function thickLine(x1: number, y1: number, x2: number, y2: number, radius: number, c: RGB, alpha = 1): void {
-  const dx = x2 - x1;
-  const dy = y2 - y1;
-  const len = Math.hypot(dx, dy);
-  const steps = Math.max(1, Math.ceil(len / Math.max(1, radius * 0.7)));
-  for (let s = 0; s <= steps; s++) {
-    const t = s / steps;
-    disc(x1 + dx * t, y1 + dy * t, radius, c, alpha);
-  }
-}
-
-function polyline(pts: Array<[number, number]>, radius: number, c: RGB, alpha = 1): void {
-  for (let i = 0; i + 1 < pts.length; i++) {
-    thickLine(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1], radius, c, alpha);
-  }
-}
-
-// ---- rotation helpers ----
-const DEG = Math.PI / 180;
-function rotPt(cx: number, cy: number, lx: number, ly: number, deg: number): [number, number] {
-  const a = deg * DEG;
-  const co = Math.cos(a);
-  const si = Math.sin(a);
-  return [cx + lx * co - ly * si, cy + lx * si + ly * co];
-}
-function rotRect(cx: number, cy: number, w: number, h: number, deg: number, c: RGB, alpha = 1): void {
-  const hw = w / 2;
-  const hh = h / 2;
-  fillPoly(
-    [
-      rotPt(cx, cy, -hw, -hh, deg),
-      rotPt(cx, cy, hw, -hh, deg),
-      rotPt(cx, cy, hw, hh, deg),
-      rotPt(cx, cy, -hw, hh, deg),
-    ],
-    c,
-    alpha,
-  );
-}
-function rotPoly(cx: number, cy: number, local: Array<[number, number]>, deg: number, c: RGB, alpha = 1): void {
-  fillPoly(local.map((p) => rotPt(cx, cy, p[0], p[1], deg)), c, alpha);
-}
-
-// ---- PNG encoder (filter per row, best of None/Sub/Up/Avg/Paeth) ----
-const CRC_TABLE: Uint32Array = (() => {
-  const t = new Uint32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    t[n] = c >>> 0;
-  }
-  return t;
-})();
-function crc32(buf: Buffer): number {
-  let c = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
-}
-function chunk(type: string, data: Buffer): Buffer {
-  const out = Buffer.alloc(12 + data.length);
-  out.writeUInt32BE(data.length, 0);
-  out.write(type, 4, "ascii");
-  data.copy(out, 8);
-  out.writeUInt32BE(crc32(Buffer.concat([Buffer.from(type, "ascii"), data])), 8 + data.length);
-  return out;
-}
-function paeth(a: number, b: number, c: number): number {
-  const p = a + b - c;
-  const pa = Math.abs(p - a);
-  const pb = Math.abs(p - b);
-  const pc = Math.abs(p - c);
-  if (pa <= pb && pa <= pc) return a;
-  if (pb <= pc) return b;
-  return c;
-}
-function encodePNG(): Buffer {
-  const stride = W * 3;
-  const raw = Buffer.alloc(H * (stride + 1));
-  const prev = Buffer.alloc(stride);
-  for (let y = 0; y < H; y++) {
-    const row = Buffer.from(img.subarray(y * stride, (y + 1) * stride));
-    let bestType = 0;
-    let bestScore = Infinity;
-    let bestRow: Buffer = row;
-    for (let f = 0; f <= 4; f++) {
-      const out = Buffer.alloc(stride);
-      let score = 0;
-      for (let x = 0; x < stride; x++) {
-        const v = row[x];
-        const a = x >= 3 ? row[x - 3] : 0;
-        const b = prev[x];
-        const cc = x >= 3 ? prev[x - 3] : 0;
-        let pred = 0;
-        if (f === 1) pred = a;
-        else if (f === 2) pred = b;
-        else if (f === 3) pred = (a + b) >> 1;
-        else if (f === 4) pred = paeth(a, b, cc);
-        const d = (v - pred) & 0xff;
-        out[x] = d;
-        score += d < 128 ? d : 256 - d;
-      }
-      if (score < bestScore) {
-        bestScore = score;
-        bestType = f;
-        bestRow = out;
-      }
-    }
-    raw[y * (stride + 1)] = bestType;
-    bestRow.copy(raw, y * (stride + 1) + 1);
-    row.copy(prev);
-  }
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(W, 0);
-  ihdr.writeUInt32BE(H, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 2; // color type RGB
-  ihdr[10] = 0;
-  ihdr[11] = 0;
-  ihdr[12] = 0;
-  const idat = zlib.deflateSync(raw, { level: 9 });
-  return Buffer.concat([
-    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
-    chunk("IHDR", ihdr),
-    chunk("IDAT", idat),
-    chunk("IEND", Buffer.alloc(0)),
-  ]);
-}
-
-// ---- palette ----
-const SKY_STOPS: Array<[number, RGB]> = [
-  [0, [26, 6, 34]],
-  [0.22, [74, 13, 44]],
-  [0.42, [158, 32, 22]],
-  [0.58, [238, 92, 16]],
-  [0.72, [255, 176, 46]],
-  [0.82, [255, 211, 94]],
-  [1, [255, 196, 80]],
-];
-const SUN_C: [number, number] = [580, 568];
-const SUN_R = 202;
-const DECK_Y = 778;
-const GAP_L = 400;
-const GAP_R = 640;
-
-// ---- sky gradient ----
-function drawSky(): void {
-  for (let y = 0; y < H; y++) {
-    const t = y / (H - 1);
-    let i = 0;
-    while (i + 1 < SKY_STOPS.length && SKY_STOPS[i + 1][0] < t) i++;
-    const s0 = SKY_STOPS[i];
-    const s1 = SKY_STOPS[Math.min(i + 1, SKY_STOPS.length - 1)];
-    const f = s1[0] === s0[0] ? 0 : (t - s0[0]) / (s1[0] - s0[0]);
-    const c = mixC(s0[1], s1[1], Math.max(0, Math.min(1, f)));
-    // faint deterministic grain so the gradient never bands
-    const g = (rnd() - 0.5) * 3;
-    for (let x = 0; x < W; x++) put(x, y, [c[0] + g, c[1] + g, c[2] + g]);
-  }
-}
-
-// ---- sun with halo and cloud bands ----
-function drawSun(): void {
-  // wide soft halo
-  for (let r = 360; r > SUN_R + 40; r -= 12) {
-    disc(SUN_C[0], SUN_C[1], r, [255, 110, 28], 0.045);
-  }
-  // disc: edge orange -> core near-white, concentric rings
-  for (let r = SUN_R; r > 0; r -= 3) {
-    const t = 1 - r / SUN_R; // 0 edge, 1 core
-    const c = mixC(mixC([255, 138, 30], [255, 210, 62], Math.min(1, t * 1.6)), [255, 248, 220], Math.max(0, (t - 0.55) / 0.45));
-    disc(SUN_C[0], SUN_C[1], r, c);
-  }
-  // dark cloud bands crossing the sun (drawn before the train) — thin,
-  // off-centre, so they never bisect the disc
-  ellipse(SUN_C[0], 486, 250, 17, [122, 20, 48], 0.3);
-  ellipse(SUN_C[0], 736, 260, 14, [94, 18, 48], 0.24);
-  // thin bright rim where the bands meet the disc
-  ellipse(SUN_C[0], 505, 250, 4, [255, 190, 90], 0.45);
-  ellipse(SUN_C[0], 751, 260, 4, [255, 170, 70], 0.35);
-}
-
-// ---- high clouds + birds ----
-function drawClouds(): void {
-  const clouds: Array<[number, number, number, number, RGB, number]> = [
-    [210, 150, 190, 20, [94, 18, 48], 0.75],
-    [300, 176, 150, 14, [140, 30, 44], 0.6],
-    [790, 120, 220, 22, [94, 18, 48], 0.8],
-    [880, 148, 160, 14, [150, 34, 46], 0.55],
-    [520, 220, 170, 16, [110, 22, 50], 0.6],
-    [120, 330, 150, 15, [120, 24, 48], 0.55],
-    [930, 330, 170, 16, [110, 22, 50], 0.6],
-    [60, 470, 130, 13, [130, 28, 46], 0.5],
-    [970, 470, 130, 13, [130, 28, 46], 0.5],
-  ];
-  for (const [cx, cy, rx, ry, c, a] of clouds) {
-    ellipse(cx, cy + 7, rx, ry * 0.55, [255, 122, 40], a * 0.4);
-    ellipse(cx, cy, rx, ry, c, a);
-  }
-  // birds, tiny silhouettes for scale
-  const birds: Array<[number, number, number]> = [
-    [290, 285, 15],
-    [335, 262, 12],
-    [700, 232, 14],
-    [748, 262, 11],
-  ];
-  for (const [bx, by, s] of birds) {
-    thickLine(bx - s, by - s * 0.35, bx, by, 2, [26, 8, 18], 0.9);
-    thickLine(bx, by, bx + s, by - s * 0.35, 2, [26, 8, 18], 0.9);
-  }
-}
-
-// ---- canyon, gorge, river ----
-function drawCanyon(): void {
-  // distant canyon wall visible through the gap, behind the bridge
-  fillPoly(
-    [
-      [GAP_L - 10, DECK_Y],
-      [GAP_R + 10, DECK_Y],
-      [GAP_R + 10, 900],
-      [GAP_L - 10, 900],
-    ],
-    [58, 18, 36],
-  );
-  thickLine(GAP_L - 10, 838, GAP_R + 10, 832, 3, [120, 40, 44], 0.5);
-  thickLine(GAP_L - 10, 872, GAP_R + 10, 866, 3, [90, 28, 40], 0.45);
-  // gorge depth between the cliffs, with faint strata and bounce light
-  fillPoly(
-    [
-      [408, 850],
-      [632, 846],
-      [618, H],
-      [424, H],
-    ],
-    [13, 4, 9],
-  );
-  thickLine(420, 892, 624, 886, 2, [58, 22, 34], 0.5);
-  thickLine(424, 928, 620, 922, 2, [44, 16, 28], 0.45);
-  // river glint far below
-  for (let i = 0; i < 3; i++) {
-    const y = 952 + i * 15;
-    thickLine(452 + i * 6, y, 596 - i * 8, y, 3, [255, 176, 46], 0.8 - i * 0.18);
-  }
-  disc(520, 972, 46, [255, 140, 40], 0.05);
-  // left cliff
-  const leftTop: Array<[number, number]> = [
-    [0, 872],
-    [90, 838],
-    [180, 868],
-    [270, 842],
-    [350, 878],
-    [412, 852],
-  ];
-  fillPoly([...leftTop, [430, H], [0, H]], [28, 10, 18]);
-  polyline(leftTop, 2.5, [255, 138, 42], 0.55);
-  // right cliff
-  const rightTop: Array<[number, number]> = [
-    [628, 846],
-    [700, 872],
-    [780, 838],
-    [860, 866],
-    [940, 830],
-    [1024, 862],
-  ];
-  fillPoly([...rightTop, [1024, H], [618, H]], [28, 10, 18]);
-  polyline(rightTop, 2.5, [255, 138, 42], 0.55);
-}
-
-// ---- broken bridge ----
-function quadCurve(p0: [number, number], p1: [number, number], p2: [number, number], n: number): Array<[number, number]> {
-  const pts: Array<[number, number]> = [];
-  for (let i = 0; i <= n; i++) {
-    const t = i / n;
-    const u = 1 - t;
-    pts.push([u * u * p0[0] + 2 * u * t * p1[0] + t * t * p2[0], u * u * p0[1] + 2 * u * t * p1[1] + t * t * p2[1]]);
-  }
-  return pts;
-}
-
-function drawBridge(): void {
-  const STEEL: RGB = [20, 9, 15];
-  const STEEL2: RGB = [34, 14, 22];
-  const RIM: RGB = [255, 154, 46];
-  // decks
-  fillRect(0, DECK_Y, GAP_L, DECK_Y + 26, STEEL);
-  fillRect(GAP_R, DECK_Y, W, DECK_Y + 26, STEEL);
-  // sunlit top edge of each deck
-  thickLine(0, DECK_Y, GAP_L, DECK_Y, 2, RIM, 0.85);
-  thickLine(GAP_R, DECK_Y, W, DECK_Y, 2, RIM, 0.85);
-  // rails on the decks
-  thickLine(0, DECK_Y - 5, GAP_L - 8, DECK_Y - 5, 1.8, [70, 30, 36], 0.9);
-  thickLine(GAP_R + 8, DECK_Y - 5, W, DECK_Y - 5, 1.8, [70, 30, 36], 0.9);
-  // jagged broken ends
-  fillPoly(
-    [
-      [GAP_L - 14, DECK_Y],
-      [GAP_L, DECK_Y - 10],
-      [GAP_L + 12, DECK_Y + 4],
-      [GAP_L, DECK_Y + 26],
-      [GAP_L - 14, DECK_Y + 26],
-    ],
-    STEEL2,
-  );
-  fillPoly(
-    [
-      [GAP_R + 14, DECK_Y],
-      [GAP_R, DECK_Y - 10],
-      [GAP_R - 12, DECK_Y + 4],
-      [GAP_R, DECK_Y + 26],
-      [GAP_R + 14, DECK_Y + 26],
-    ],
-    STEEL2,
-  );
-  // under-deck truss zigzags
-  const truss = (x0: number, x1: number): void => {
-    thickLine(x0, DECK_Y + 26, x1, DECK_Y + 26, 3, STEEL2);
-    thickLine(x0, DECK_Y + 78, x1, DECK_Y + 78, 3, STEEL2);
-    const step = 56;
-    for (let x = x0; x + step <= x1; x += step) {
-      thickLine(x, DECK_Y + 26, x + step / 2, DECK_Y + 78, 3, STEEL2);
-      thickLine(x + step / 2, DECK_Y + 78, x + step, DECK_Y + 26, 3, STEEL2);
-      thickLine(x + step / 2, DECK_Y + 26, x + step / 2, DECK_Y + 78, 2.5, STEEL2);
-    }
-  };
-  truss(0, GAP_L - 8);
-  truss(GAP_R + 8, W);
-  // support towers
-  const tower = (x0: number, x1: number, yTop: number, yBot: number): void => {
-    thickLine(x0, yTop, x0, yBot, 5, STEEL);
-    thickLine(x1, yTop, x1, yBot, 5, STEEL);
-    thickLine(x0, yTop + 8, x1, yBot - 8, 3.5, STEEL2);
-    thickLine(x1, yTop + 8, x0, yBot - 8, 3.5, STEEL2);
-    thickLine(x0, yTop, x1, yTop, 4, STEEL2);
-  };
-  tower(64, 168, DECK_Y + 26, 856);
-  tower(856, 960, DECK_Y + 26, 850);
-  // THE TWIST: the left rails curl upward like a ski jump, launching the train.
-  // Two rails bending up out of the break, ending mid-air with sparks.
-  const curl1 = quadCurve([GAP_L - 6, DECK_Y - 5], [492, DECK_Y - 62], [548, 664], 24);
-  const curl2 = quadCurve([GAP_L - 6, DECK_Y + 3], [486, DECK_Y - 48], [538, 672], 24);
-  polyline(curl1, 4.5, [42, 20, 30], 1);
-  polyline(curl2, 4.5, [42, 20, 30], 1);
-  polyline(curl1, 2.2, RIM, 0.95);
-  // snapped rail stubs jutting up at both breaks
-  thickLine(GAP_L - 4, DECK_Y - 4, GAP_L + 22, DECK_Y - 44, 3, [58, 26, 34], 1);
-  thickLine(GAP_R + 4, DECK_Y - 4, GAP_R - 20, DECK_Y - 40, 3, [58, 26, 34], 1);
-  // right rails bent down into the gorge
-  const bend = quadCurve([GAP_R + 6, DECK_Y - 5], [600, DECK_Y + 26], [584, 868], 18);
-  polyline(bend, 4, [42, 20, 30], 1);
-  // dangling cables from the breaks
-  const cable1 = quadCurve([GAP_L - 20, DECK_Y + 20], [GAP_L + 26, DECK_Y + 96], [GAP_L + 8, DECK_Y + 150], 18);
-  const cable2 = quadCurve([GAP_R + 22, DECK_Y + 20], [GAP_R - 24, DECK_Y + 88], [GAP_R - 6, DECK_Y + 138], 18);
-  polyline(cable1, 2, [36, 16, 26], 0.95);
-  polyline(cable2, 2, [36, 16, 26], 0.95);
-}
-
-// ---- the jump arc (Catmull-Rom through control points) ----
-const ARC_PTS: Array<[number, number]> = [
-  [120, 782],
-  [300, 700],
-  [500, 615],
-  [700, 556],
-  [860, 598],
-  [985, 722],
-];
-interface ArcSample {
-  x: number;
-  y: number;
-  ang: number;
-}
-function buildArc(): ArcSample[] {
-  const pts: ArcSample[] = [];
-  const catmull = (p0: number, p1: number, p2: number, p3: number, t: number): number =>
-    0.5 * (2 * p1 + (p2 - p0) * t + (2 * p0 - 5 * p1 + 4 * p2 - p3) * t * t + (-p0 + 3 * p1 - 3 * p2 + p3) * t * t * t);
-  for (let s = 0; s + 1 < ARC_PTS.length; s++) {
-    const p0 = ARC_PTS[Math.max(0, s - 1)];
-    const p1 = ARC_PTS[s];
-    const p2 = ARC_PTS[s + 1];
-    const p3 = ARC_PTS[Math.min(ARC_PTS.length - 1, s + 2)];
-    for (let i = 0; i < 60; i++) {
-      const t = i / 60;
-      pts.push({ x: catmull(p0[0], p1[0], p2[0], p3[0], t), y: catmull(p0[1], p1[1], p2[1], p3[1], t), ang: 0 });
-    }
-  }
-  pts.push({ x: ARC_PTS[ARC_PTS.length - 1][0], y: ARC_PTS[ARC_PTS.length - 1][1], ang: 0 });
-  for (let i = 0; i < pts.length; i++) {
-    const a = pts[Math.max(0, i - 4)];
-    const b = pts[Math.min(pts.length - 1, i + 4)];
-    pts[i].ang = (Math.atan2(b.y - a.y, b.x - a.x) / DEG) as number;
-  }
-  return pts;
-}
-const ARC = buildArc();
-function arcAt(x: number): ArcSample {
-  let best = ARC[0];
-  let bd = Infinity;
-  for (const p of ARC) {
-    const d = Math.abs(p.x - x);
-    if (d < bd) {
-      bd = d;
-      best = p;
-    }
-  }
-  return best;
-}
-
-// ---- speed lines ----
-function drawSpeedLines(): void {
-  for (let i = 0; i < 11; i++) {
-    const x = 90 + rnd() * 850;
-    const y = 170 + rnd() * 380;
-    const len = 50 + rnd() * 90;
-    const ang = (-19 + (rnd() - 0.5) * 10) * DEG;
-    const x2 = x + Math.cos(ang) * len;
-    const y2 = y + Math.sin(ang) * len;
-    thickLine(x, y, x2, y2, 1.2 + rnd() * 1.2, [255, 179, 71], 0.1 + rnd() * 0.12);
-  }
-}
-
-// ---- smoke trailing behind the locomotive ----
-function drawSmoke(chimney: [number, number], locoAng: number): void {
-  const a = locoAng * DEG;
-  const bx = Math.cos(a);
-  const by = Math.sin(a);
-  for (let i = 0; i < 20; i++) {
-    const t = i / 20;
-    const back = 40 + t * 380 + (rnd() - 0.5) * 30;
-    const up = -6 - t * 42 + (rnd() - 0.5) * 36;
-    const px = chimney[0] - bx * back + -by * up;
-    const py = chimney[1] - by * back + bx * up;
-    const r = 10 + t * 26 + rnd() * 9;
-    const c = mixC([51, 22, 46], [96, 52, 62], t);
-    disc(px, py, r, c, 0.3 - t * 0.13);
-    // sunlit rim on the lower-right edge of each puff
-    disc(px + r * 0.35, py + r * 0.42, r * 0.55, [255, 140, 60], 0.13);
-  }
-}
-
-// ---- sparks ----
-const SPARK_COLORS: RGB[] = [
-  [255, 246, 200],
-  [255, 210, 62],
-  [255, 138, 30],
-  [255, 90, 30],
-];
-function sparkBurst(cx: number, cy: number, n: number, spread: number, dirAng: number): void {
-  for (let i = 0; i < n; i++) {
-    const ang = (dirAng + (rnd() - 0.5) * spread) * DEG;
-    const d = 4 + rnd() * 46;
-    const px = cx + Math.cos(ang) * d;
-    const py = cy + Math.sin(ang) * d;
-    const c = SPARK_COLORS[Math.floor(rnd() * SPARK_COLORS.length)];
-    if (rnd() < 0.45) {
-      // streak
-      const l = 8 + rnd() * 20;
-      thickLine(px, py, px + Math.cos(ang) * l, py + Math.sin(ang) * l, 1.4 + rnd() * 1.2, c, 0.95);
-    } else {
-      disc(px, py, 1.2 + rnd() * 2.2, c, 0.95);
-    }
-  }
-}
-
-// ---- train ----
-const BODY: RGB = [16, 6, 12];
-const BODY2: RGB = [26, 10, 18];
-const RIM: RGB = [255, 176, 46];
-const WINDOW: RGB = [255, 215, 106];
-
-function drawWheel(cx: number, cy: number, deg: number, lx: number, ly: number, r: number): void {
-  const [wx, wy] = rotPt(cx, cy, lx, ly, deg);
-  disc(wx, wy, r, [8, 3, 6]);
-  disc(wx, wy, r * 0.45, [58, 26, 34], 0.9);
-  disc(wx - r * 0.3, wy - r * 0.3, r * 0.22, [255, 176, 46], 0.7);
-}
-
-function drawCar(cx: number, cy: number, deg: number, len: number, ht: number): void {
-  // body
-  rotRect(cx, cy, len, ht, deg, BODY);
-  // roof
-  rotRect(cx, cy - ht / 2 - 3, len * 0.92, 8, deg, BODY2);
-  // sunlit top edge
-  const t1 = rotPt(cx, cy, -len / 2, -ht / 2, deg);
-  const t2 = rotPt(cx, cy, len / 2, -ht / 2, deg);
-  thickLine(t1[0], t1[1], t2[0], t2[1], 2.2, RIM, 0.9);
-  // glowing windows
-  const nWin = Math.floor((len - 36) / 36);
-  for (let i = 0; i < nWin; i++) {
-    const lx = -len / 2 + 24 + i * 36;
-    const [wx, wy] = rotPt(cx, cy, lx, -ht * 0.08, deg);
-    rotRect(wx, wy, 17, 15, deg, i % 3 === 2 ? [255, 243, 176] : WINDOW, 0.95);
-  }
-  // wheels
-  drawWheel(cx, cy, deg, -len / 2 + 28, ht / 2 + 10, 13);
-  drawWheel(cx, cy, deg, len / 2 - 28, ht / 2 + 10, 13);
-  // under-shadow
-  rotRect(cx, cy + ht / 2 + 4, len * 0.94, 6, deg, [10, 4, 8], 0.9);
-}
-
-function drawLoco(cx: number, cy: number, deg: number): void {
-  const len = 275;
-  const ht = 112;
-  // body with sloped nose
-  rotPoly(
-    cx,
-    cy,
-    [
-      [-137, -ht / 2],
-      [86, -ht / 2],
-      [134, -16],
-      [134, ht / 2],
-      [-137, ht / 2],
-    ],
-    deg,
-    BODY,
-  );
-  // cab roof, slightly raised at the rear
-  rotRect(cx - 90, cy - ht / 2 - 7, 86, 15, deg, BODY2);
-  // smokestack near the front, pouring smoke
-  rotRect(cx + 68, cy - ht / 2 - 16, 16, 26, deg, BODY2);
-  const chimTop = rotPt(cx, cy, 77, -ht / 2 - 30, deg);
-  // sunlit top edge + nose edge
-  const t1 = rotPt(cx, cy, -137, -ht / 2, deg);
-  const t2 = rotPt(cx, cy, 86, -ht / 2, deg);
-  const t3 = rotPt(cx, cy, 134, -16, deg);
-  thickLine(t1[0], t1[1], t2[0], t2[1], 2.5, RIM, 0.95);
-  thickLine(t2[0], t2[1], t3[0], t3[1], 2.5, RIM, 0.95);
-  // cab windows
-  const w1 = rotPt(cx, cy, -112, -ht * 0.14, deg);
-  rotRect(w1[0], w1[1], 26, 20, deg, [255, 243, 176], 0.95);
-  const w2 = rotPt(cx, cy, -72, -ht * 0.14, deg);
-  rotRect(w2[0], w2[1], 18, 20, deg, WINDOW, 0.95);
-  // side vents
-  for (let i = 0; i < 3; i++) {
-    const [vx, vy] = rotPt(cx, cy, -22 + i * 24, ht * 0.1, deg);
-    rotRect(vx, vy, 12, 22, deg, BODY2, 0.95);
-  }
-  // wheels, bigger driving wheels
-  drawWheel(cx, cy, deg, -104, ht / 2 + 11, 15);
-  drawWheel(cx, cy, deg, -33, ht / 2 + 11, 15);
-  drawWheel(cx, cy, deg, 42, ht / 2 + 11, 15);
-  drawWheel(cx, cy, deg, 101, ht / 2 + 11, 13);
-  // headlight + beam toward the sun-side sky
-  const [hx, hy] = rotPt(cx, cy, 134, 6, deg);
-  disc(hx, hy, 7, [255, 251, 232]);
-  disc(hx, hy, 3.5, [255, 255, 255]);
-  const ba = (deg - 10) * DEG;
-  const beam: Array<[number, number]> = [
-    [hx, hy],
-    [hx + Math.cos(ba - 0.09) * 340, hy + Math.sin(ba - 0.09) * 340],
-    [hx + Math.cos(ba + 0.09) * 340, hy + Math.sin(ba + 0.09) * 340],
-  ];
-  fillPoly(beam, [255, 244, 200], 0.2);
-  fillPoly(
-    [
-      [hx, hy],
-      [hx + Math.cos(ba - 0.045) * 340, hy + Math.sin(ba - 0.045) * 340],
-      [hx + Math.cos(ba + 0.045) * 340, hy + Math.sin(ba + 0.045) * 340],
-    ],
-    [255, 244, 200],
-    0.16,
-  );
-  void chimTop;
-}
-
-function drawTrain(): void {
-  const loco = arcAt(745);
-  const car1 = arcAt(555);
-  const car2 = arcAt(385);
-  const car3 = arcAt(215);
-  // smoke first, behind the train
-  const chim = rotPt(loco.x, loco.y, 77, -86, loco.ang);
-  drawSmoke(chim, loco.ang);
-  // cars back to front so overlaps read as coupled
-  drawCar(car3.x, car3.y, car3.ang, 190, 84);
-  drawCar(car2.x, car2.y, car2.ang, 200, 84);
-  drawCar(car1.x, car1.y, car1.ang, 200, 84);
-  drawLoco(loco.x, loco.y, loco.ang);
-  // sparks: wheels, breaks, rail-curl tip, one wheel torn loose
-  for (const c of [car3, car2, car1, loco]) {
-    const [wx, wy] = rotPt(c.x, c.y, 0, 52, c.ang);
-    sparkBurst(wx, wy + 12, 7, 120, 200);
-  }
-  sparkBurst(GAP_L, DECK_Y - 6, 26, 170, -60);
-  sparkBurst(GAP_R, DECK_Y - 6, 22, 170, -120);
-  sparkBurst(548, 664, 22, 150, -70);
-  // a wheel torn off, tumbling into the gorge with a spark trail
-  disc(468, 838, 14, [8, 3, 6]);
-  disc(468, 838, 6, [58, 26, 34], 0.9);
-  sparkBurst(468, 838, 16, 200, 90);
-  // embers drifting up from the gorge
-  for (let i = 0; i < 14; i++) {
-    const ex = 430 + rnd() * 180;
-    const ey = 900 + rnd() * 90;
-    disc(ex, ey, 1.5 + rnd() * 2, SPARK_COLORS[Math.floor(rnd() * 3)], 0.8);
-  }
-}
-
-// ---- vignette ----
-function drawVignette(): void {
-  for (let y = 0; y < H; y++) {
-    for (let x = 0; x < W; x++) {
-      const dx = (x - W / 2) / (W / 2);
-      const dy = (y - H / 2) / (H / 2);
-      const d = Math.sqrt(dx * dx + dy * dy);
-      if (d > 0.74) {
-        const f = 1 - (d - 0.74) * 0.5;
-        const i = (y * W + x) * 3;
-        img[i] = clamp255(img[i] * f);
-        img[i + 1] = clamp255(img[i + 1] * f);
-        img[i + 2] = clamp255(img[i + 2] * f);
+      for (let x = x0; x <= x1; x++) {
+        const c = shader(x, y);
+        blend(x, y, c[0], c[1], c[2], c[3]);
       }
     }
   }
 }
 
-// ---- main ----
-function main(): void {
-  drawSky();
-  drawSun();
-  drawClouds();
-  drawCanyon();
-  drawBridge();
-  drawSpeedLines();
-  drawTrain();
-  drawVignette();
-  const outDir = process.env.MAKEFUN_OUTPUT_DIR || "/output";
-  fs.mkdirSync(outDir, { recursive: true });
-  const png = encodePNG();
-  fs.writeFileSync(path.join(outDir, "entry.png"), png);
+// ---------------------------------------------------------------------------
+// 1. Sky: deep violet at the top burning down to gold at the horizon.
+// ---------------------------------------------------------------------------
+const SKY_STOPS = [
+  [0, 36, 10, 62], // deep violet
+  [240, 96, 26, 88], // magenta dusk
+  [430, 196, 66, 44], // burnt orange
+  [560, 248, 138, 52], // amber
+  [HORIZON, 255, 178, 70], // molten gold
+];
+for (let y = 0; y < HORIZON; y++) {
+  let s0 = SKY_STOPS[0];
+  let s1 = SKY_STOPS[SKY_STOPS.length - 1];
+  for (let i = 0; i < SKY_STOPS.length - 1; i++) {
+    if (y >= SKY_STOPS[i][0] && y <= SKY_STOPS[i + 1][0]) {
+      s0 = SKY_STOPS[i];
+      s1 = SKY_STOPS[i + 1];
+      break;
+    }
+  }
+  const t = s1[0] === s0[0] ? 0 : (y - s0[0]) / (s1[0] - s0[0]);
+  const r = Math.round(lerp(s0[1], s1[1], t));
+  const g = Math.round(lerp(s0[2], s1[2], t));
+  const b = Math.round(lerp(s0[3], s1[3], t));
+  for (let x = 0; x < W; x++) put(x, y, r, g, b);
 }
-main();
+
+// ---------------------------------------------------------------------------
+// 2. The low sun, half-sunk, with a wide burning glow.
+// ---------------------------------------------------------------------------
+const SUN = { x: 330, y: 588, r: 88 };
+for (let rad = 290; rad > SUN.r; rad -= 6) {
+  const a = 0.085 * (1 - (rad - SUN.r) / 200);
+  disc(SUN.x, SUN.y, rad, 255, 148, 58, Math.max(0, a));
+}
+disc(SUN.x, SUN.y, SUN.r, 255, 216, 128, 1);
+disc(SUN.x, SUN.y, SUN.r - 26, 255, 236, 178, 1);
+// Sun's hot core.
+disc(SUN.x, SUN.y, SUN.r - 52, 255, 248, 214, 1);
+
+// ---------------------------------------------------------------------------
+// 3. A distant low ridge on the left horizon, half-eating the sun.
+// ---------------------------------------------------------------------------
+fillPolyShader(
+  [
+    [0, HORIZON],
+    [0, 612],
+    [90, 596],
+    [180, 578],
+    [260, 592],
+    [340, 614],
+    [420, HORIZON],
+  ],
+  () => [10, 44, 62, 1],
+);
+
+// ---------------------------------------------------------------------------
+// 4. Sea: dark teal falling away into night, with the sun's golden road.
+// ---------------------------------------------------------------------------
+for (let y = HORIZON; y < H; y++) {
+  const t = (y - HORIZON) / (H - HORIZON);
+  const c = mix3([12, 56, 78], [2, 14, 26], t);
+  for (let x = 0; x < W; x++) put(x, y, c[0] | 0, c[1] | 0, c[2] | 0);
+}
+// Golden reflection: shimmering dashes widening toward the viewer.
+for (let y = HORIZON + 8; y < H - 8; y += 7) {
+  const w = 26 + (y - HORIZON) * 0.34;
+  const cx = SUN.x + Math.sin(y * 0.02) * 8;
+  const dashes = 1 + Math.floor(rand() * 3);
+  for (let d = 0; d < dashes; d++) {
+    const len = 12 + rand() * 34;
+    const x0 = cx - w / 2 + rand() * (w - len);
+    const a = 0.16 + rand() * 0.4 * (1 - (y - HORIZON) / 420);
+    thickLine(x0, y, x0 + len, y, 3, 255, 186, 92, Math.max(0.08, a));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 5. THE WAVE — a giant curling barrel filling the right two-thirds.
+//    Crest sweeps up from the right edge, the lip hooks over and down, the
+//    face curves back to the sea. Its shader glows gold from inside, where
+//    the sunset shines straight through the water.
+// ---------------------------------------------------------------------------
+const crestPts = sampleCurve(
+  (t) => cubic([1024, 300], [920, 180], [740, 165], [620, 230], t),
+  48,
+);
+const lipPts = sampleCurve((t) => quad([620, 230], [560, 300], [640, 395], t), 24);
+const facePts = sampleCurve(
+  (t) => cubic([640, 395], [545, 620], [600, 860], [720, 1024], t),
+  48,
+);
+const wavePts = [
+  [1024, 1024],
+  [1024, 300],
+  ...crestPts.slice(1),
+  ...lipPts.slice(1),
+  ...facePts.slice(1),
+  [720, 1024],
+];
+
+function waveColor(x, y) {
+  const v = clamp((y - 180) / 844, 0, 1);
+  let c;
+  if (v < 0.5) c = mix3([34, 140, 128], [14, 92, 102], v / 0.5);
+  else c = mix3([14, 92, 102], [5, 36, 54], (v - 0.5) / 0.5);
+  // Sunset burning through the water near the barrel.
+  const dx = x - 760;
+  const dy = y - 360;
+  const d = Math.sqrt(dx * dx + dy * dy);
+  const g = Math.pow(Math.max(0, 1 - d / 380), 2) * 0.6;
+  c = [lerp(c[0], 255, g), lerp(c[1], 178, g), lerp(c[2], 72, g)];
+  // Depth darkening at the far right edge.
+  if (x > 960) {
+    const s = ((x - 960) / 64) * 0.25;
+    c = [c[0] * (1 - s), c[1] * (1 - s), c[2] * (1 - s)];
+  }
+  return [c[0], c[1], c[2], 1];
+}
+fillPolyShader(wavePts, waveColor);
+
+// Sunlight shafts slanting across the wave face — thin, soft, few, kept
+// to the right side so they never cross the surfer.
+for (let i = 0; i < 3; i++) {
+  const x0 = 800 + i * 62 + rand() * 18;
+  const y0 = 380 + rand() * 40;
+  thickLine(x0, y0, x0 - 100, y0 + 240, 4, 255, 200, 100, 0.05 + rand() * 0.03);
+}
+
+// ---------------------------------------------------------------------------
+// 6. The barrel mouth: a dark eye in the wave, rimmed with gold fire.
+// ---------------------------------------------------------------------------
+// (No separate barrel mouth is drawn: the curling lip, the gold glow
+// burning through the face, and the surfer inside the curl carry the tube.
+// A drawn opening kept reading as a floating object, not as water.)
+
+// ---------------------------------------------------------------------------
+// 7. The lip: white-gold foam tearing along the crest, drips, and spray
+//    exploding upward off it.
+// ---------------------------------------------------------------------------
+for (let i = 0; i + 1 < crestPts.length; i++) {
+  const a = crestPts[i];
+  const b = crestPts[i + 1];
+  thickLine(a[0], a[1], b[0], b[1], 15, 250, 248, 238, 0.95);
+}
+for (let i = 0; i + 1 < crestPts.length; i++) {
+  const a = crestPts[i];
+  const b = crestPts[i + 1];
+  thickLine(a[0], a[1] + 7, b[0], b[1] + 7, 5, 255, 196, 92, 0.85);
+}
+// Drips hanging off the lip.
+for (let i = 2; i < crestPts.length - 2; i += 3) {
+  const p = crestPts[i];
+  const len = 10 + rand() * 24;
+  thickLine(p[0], p[1] + 4, p[0] + (rand() - 0.5) * 8, p[1] + 4 + len, 3, 250, 250, 244, 0.85);
+}
+// Spray bursting off the crest.
+for (let i = 0; i < 380; i++) {
+  const p = crestPts[Math.floor(rand() * crestPts.length)];
+  const x = p[0] + (rand() - 0.5) * 36;
+  const y = p[1] - rand() * 78;
+  const r = 1 + rand() * 3.2;
+  if (rand() < 0.45) disc(x, y, r, 255, 210, 120, 0.55 + rand() * 0.4);
+  else disc(x, y, r, 252, 252, 246, 0.6 + rand() * 0.4);
+}
+// Long spray streaks flung up and left.
+for (let i = 0; i < 48; i++) {
+  const p = crestPts[Math.floor(rand() * crestPts.length)];
+  const ang = Math.PI * (0.72 + rand() * 0.28);
+  const len = 22 + rand() * 56;
+  thickLine(p[0], p[1], p[0] + Math.cos(ang) * len, p[1] - Math.sin(ang) * len, 2, 252, 252, 246, 0.55 + rand() * 0.3);
+}
+// A big plume exploding off the lip tip.
+for (let i = 0; i < 70; i++) {
+  const ang = rand() * Math.PI * 2;
+  const len = 12 + rand() * 90;
+  const x = 620 + Math.cos(ang) * len;
+  const y = 232 + Math.sin(ang) * len * 0.8;
+  disc(x, y, 1 + rand() * 2.6, 252, 252, 246, 0.5 + rand() * 0.45);
+}
+
+// ---------------------------------------------------------------------------
+// 8. Foam at the wave's base and streaks across the sea.
+// ---------------------------------------------------------------------------
+for (let i = 0; i < 150; i++) {
+  const x = 700 + rand() * 320;
+  const y = 930 + rand() * 90;
+  disc(x, y, 1.5 + rand() * 5, 240, 246, 248, 0.25 + rand() * 0.5);
+}
+for (let i = 0; i < 10; i++) {
+  const y = 700 + rand() * 300;
+  const x0 = 40 + rand() * 300;
+  const len = 60 + rand() * 180;
+  thickLine(x0, y, x0 + len, y + (rand() - 0.5) * 6, 2.5, 235, 242, 246, 0.2 + rand() * 0.25);
+}
+
+// ---------------------------------------------------------------------------
+// 9. THE SURFER — one tiny dark silhouette dropping down the face,
+//    board lit gold, spray trailing behind the tail.
+// ---------------------------------------------------------------------------
+const SURF = { x: 655, y: 700 };
+// Spray trail behind the board.
+for (let i = 0; i < 26; i++) {
+  const t = i / 26;
+  const x = 640 - t * 46 + (rand() - 0.5) * 10;
+  const y = 730 + t * 26 + (rand() - 0.5) * 8;
+  disc(x, y, 1.5 + rand() * 2.5, 250, 250, 244, 0.85 - t * 0.5);
+}
+// Board, nose down the face, gold edge catching the sun.
+thickLine(628, 734, 682, 710, 6, 248, 244, 232, 1);
+thickLine(628, 732, 682, 708, 2, 255, 200, 96, 1);
+// The surfer: crouched, arms out, black against the glowing wall.
+const INK = [8, 10, 14];
+disc(SURF.x, SURF.y - 4, 5, INK[0], INK[1], INK[2], 1); // head
+thickLine(SURF.x, SURF.y + 1, SURF.x - 4, SURF.y + 20, 6, INK[0], INK[1], INK[2], 1); // torso
+thickLine(SURF.x - 3, SURF.y + 6, SURF.x - 18, SURF.y + 12, 4, INK[0], INK[1], INK[2], 1); // back arm
+thickLine(SURF.x - 3, SURF.y + 6, SURF.x + 13, SURF.y + 1, 4, INK[0], INK[1], INK[2], 1); // front arm
+thickLine(SURF.x - 4, SURF.y + 20, SURF.x - 16, SURF.y + 33, 4.5, INK[0], INK[1], INK[2], 1); // back leg
+thickLine(SURF.x - 4, SURF.y + 20, SURF.x + 10, SURF.y + 31, 4.5, INK[0], INK[1], INK[2], 1); // front leg
+
+// ---------------------------------------------------------------------------
+// 10. Birds for scale — five small silhouettes high in the burning sky.
+// ---------------------------------------------------------------------------
+for (const [bx, by, s] of [
+  [150, 170, 9],
+  [215, 140, 7],
+  [270, 190, 8],
+  [900, 120, 8],
+  [950, 160, 6],
+]) {
+  thickLine(bx - s, by - 3, bx, by + 2, 2, 24, 10, 30, 0.9);
+  thickLine(bx + s, by - 3, bx, by + 2, 2, 24, 10, 30, 0.9);
+}
+
+// ---------------------------------------------------------------------------
+// 11. The words to the judge — big block letters, gold first line, white
+//     after, dark outline so they punch through the sky at any size.
+// ---------------------------------------------------------------------------
+const FONT = {
+  A: ['01110', '10001', '10001', '11111', '10001', '10001', '10001'],
+  B: ['11110', '10001', '10001', '11110', '10001', '10001', '11110'],
+  C: ['01110', '10001', '10000', '10000', '10000', '10001', '01110'],
+  D: ['11110', '10001', '10001', '10001', '10001', '10001', '11110'],
+  E: ['11111', '10000', '10000', '11110', '10000', '10000', '11111'],
+  F: ['11111', '10000', '10000', '11110', '10000', '10000', '10000'],
+  G: ['01110', '10001', '10000', '10111', '10001', '10001', '01111'],
+  H: ['10001', '10001', '10001', '11111', '10001', '10001', '10001'],
+  I: ['01110', '00100', '00100', '00100', '00100', '00100', '01110'],
+  J: ['00111', '00010', '00010', '00010', '00010', '10010', '01100'],
+  K: ['10001', '10010', '10100', '11000', '10100', '10010', '10001'],
+  L: ['10000', '10000', '10000', '10000', '10000', '10000', '11111'],
+  M: ['10001', '11011', '10101', '10101', '10001', '10001', '10001'],
+  N: ['10001', '11001', '10101', '10011', '10001', '10001', '10001'],
+  O: ['01110', '10001', '10001', '10001', '10001', '10001', '01110'],
+  P: ['11110', '10001', '10001', '11110', '10000', '10000', '10000'],
+  Q: ['01110', '10001', '10001', '10001', '10101', '10010', '01101'],
+  R: ['11110', '10001', '10001', '11110', '10100', '10010', '10001'],
+  S: ['01111', '10000', '10000', '01110', '00001', '00001', '11110'],
+  T: ['11111', '00100', '00100', '00100', '00100', '00100', '00100'],
+  U: ['10001', '10001', '10001', '10001', '10001', '10001', '01110'],
+  V: ['10001', '10001', '10001', '10001', '10001', '01010', '00100'],
+  W: ['10001', '10001', '10001', '10101', '10101', '10101', '01010'],
+  X: ['10001', '10001', '01010', '00100', '01010', '10001', '10001'],
+  Y: ['10001', '10001', '01010', '00100', '00100', '00100', '00100'],
+  Z: ['11111', '00001', '00010', '00100', '01000', '10000', '11111'],
+  ' ': ['00000', '00000', '00000', '00000', '00000', '00000', '00000'],
+  "'": ['00100', '00100', '00000', '00000', '00000', '00000', '00000'],
+  ',': ['00000', '00000', '00000', '00000', '00100', '00100', '01000'],
+  '.': ['00000', '00000', '00000', '00000', '00000', '01100', '01100'],
+  '!': ['00100', '00100', '00100', '00100', '00100', '00000', '00100'],
+  '-': ['00000', '00000', '00000', '11111', '00000', '00000', '00000'],
+};
+
+function drawGlyph(ch, x, y, s, r, g, b, a) {
+  const rows = FONT[ch];
+  if (!rows) return;
+  for (let ry = 0; ry < 7; ry++) {
+    for (let rx = 0; rx < 5; rx++) {
+      if (rows[ry][rx] === '1') {
+        for (let dy = 0; dy < s; dy++) {
+          for (let dx = 0; dx < s; dx++) blend(x + rx * s + dx, y + ry * s + dy, r, g, b, a);
+        }
+      }
+    }
+  }
+}
+
+function drawTextRaw(text, x, y, s, r, g, b, a) {
+  let cx = x;
+  for (const ch of text) {
+    drawGlyph(ch, cx, y, s, r, g, b, a);
+    cx += 5 * s + s + 1;
+  }
+}
+
+// Outline pass (8 offsets in dark ink), then the face colour.
+function drawText(text, x, y, s, fr, fg, fb) {
+  const offs = [
+    [-3, 0],
+    [3, 0],
+    [0, -3],
+    [0, 3],
+    [-3, -3],
+    [3, 3],
+    [-3, 3],
+    [3, -3],
+  ];
+  for (const [dx, dy] of offs) drawTextRaw(text, x + dx, y + dy, s, 16, 8, 28, 0.95);
+  drawTextRaw(text, x, y, s, fr, fg, fb, 1);
+}
+
+drawText("DON'T BLINK, JUDGE!", 48, 62, 7, 255, 196, 84);
+drawText('THE WAVE', 48, 128, 7, 255, 246, 232);
+drawText('EATS THE SUN', 48, 194, 7, 255, 246, 232);
+// Small proof-of-craft line along the bottom.
+drawText('DRAWN BY CODE. NO PHOTO. NO STOCK.', 48, 976, 3, 255, 214, 140);
+
+// ---------------------------------------------------------------------------
+// 12. Encode a whole PNG (stdlib zlib) and write it.
+// ---------------------------------------------------------------------------
+function crc32(buf) {
+  let table = crc32.table;
+  if (!table) {
+    table = new Int32Array(256);
+    for (let n = 0; n < 256; n++) {
+      let c = n;
+      for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+      table[n] = c;
+    }
+    crc32.table = table;
+  }
+  let crc = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) crc = table[(crc ^ buf[i]) & 0xff] ^ (crc >>> 8);
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+function pngChunk(type, data) {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(body), 0);
+  return Buffer.concat([len, body, crc]);
+}
+
+const ihdr = Buffer.alloc(13);
+ihdr.writeUInt32BE(W, 0);
+ihdr.writeUInt32BE(H, 4);
+ihdr[8] = 8; // bit depth
+ihdr[9] = 6; // colour type 6: RGBA
+ihdr[10] = 0;
+ihdr[11] = 0;
+ihdr[12] = 0;
+
+const raw = Buffer.alloc(H * (1 + W * 4));
+for (let y = 0; y < H; y++) {
+  raw[y * (1 + W * 4)] = 0; // filter: none
+  raw.set(px.subarray(y * W * 4, (y + 1) * W * 4), y * (1 + W * 4) + 1);
+}
+const idat = deflateSync(raw, { level: 9 });
+
+const png = Buffer.concat([
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+  pngChunk('IHDR', ihdr),
+  pngChunk('IDAT', idat),
+  pngChunk('IEND', Buffer.alloc(0)),
+]);
+
+const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
+mkdirSync(outDir, { recursive: true });
+const outPath = join(outDir, 'entry.png');
+writeFileSync(outPath, png);
+console.log(
+  `wrote ${outPath} ${png.length} bytes sha256=${createHash('sha256').update(png).digest('hex')}`,
+);
